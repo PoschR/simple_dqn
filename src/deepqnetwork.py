@@ -1,15 +1,12 @@
-from neon.util.argparser import NeonArgparser
-from neon.backends import gen_backend
-from neon.initializers import Xavier
-from neon.optimizers import RMSProp, Adam, Adadelta
-from neon.layers import Affine, Conv, GeneralizedCost
-from neon.transforms import Rectlin
-from neon.models import Model
-from neon.transforms import SumSquared
-from neon.util.persist import save_obj
+import deep_q_graph as dqg
+import utils as ut
+
+import tensorflow as tf
 import numpy as np
 import os
 import logging
+import mem_top
+
 logger = logging.getLogger(__name__)
 
 class DeepQNetwork:
@@ -25,84 +22,48 @@ class DeepQNetwork:
     self.max_reward = args.max_reward
     self.batch_norm = args.batch_norm
 
-    # create Neon backend
-    self.be = gen_backend(backend = args.backend,
-                 batch_size = args.batch_size,
-                 rng_seed = args.random_seed,
-                 device_id = args.device_id,
-                 datatype = np.dtype(args.datatype).type,
-                 stochastic_round = args.stochastic_round)
+    #start tensorflow session
+    self.sess = tf.InteractiveSession()
+
 
     # prepare tensors once and reuse them
-    self.input_shape = (self.history_length,) + self.screen_dim + (self.batch_size,)
-    self.input = self.be.empty(self.input_shape)
-    self.input.lshape = self.input_shape # HACK: needed for convolutional networks
-    self.targets = self.be.empty((self.num_actions, self.batch_size))
+    self.pre_input = tf.placeholder(tf.uint8, shape=[None, self.screen_dim[1], self.screen_dim[0], self.history_length])
+    self.input = tf.to_float(self.pre_input) / 255.
 
-    # create model
-    layers = self._createLayers(num_actions)
-    self.model = Model(layers = layers)
-    self.cost = GeneralizedCost(costfunc = SumSquared())
-    # Bug fix
-    for l in self.model.layers.layers:
-      l.parallelism = 'Disabled'
-    self.model.initialize(self.input_shape[:-1], self.cost)
+    self.targets = tf.placeholder(tf.float32, shape=[None, self.num_actions])
+    self.predqvals = tf.placeholder(tf.float32, shape=[None, self.num_actions])
+
+    self.model = dqg.DeepQArchitecture(self.history_length, self.num_actions, self.input)
+
+    self.cost = tf.nn.l2_loss(self.targets - self.predqvals) #tf.clip_by_value(x, -self.clip_error, self.clip_error)
+
     if args.optimizer == 'rmsprop':
-      self.optimizer = RMSProp(learning_rate = args.learning_rate, 
-          decay_rate = args.decay_rate, 
-          stochastic_round = args.stochastic_round)
+      self.optimizer = tf.train.RMSPropOptimizer(learning_rate=args.learning_rate, decay=args.decay_rate)
     elif args.optimizer == 'adam':
-      self.optimizer = Adam(learning_rate = args.learning_rate, 
-          stochastic_round = args.stochastic_round)
+      self.optimizer = tf.train.AdamOptimizer(learning_rate = args.learning_rate)
     elif args.optimizer == 'adadelta':
-      self.optimizer = Adadelta(decay = args.decay_rate, 
-          stochastic_round = args.stochastic_round)
+      self.optimizer = tf.train.AdadeltaOptimizer(rho=args.decay_rate)
     else:
-      assert false, "Unknown optimizer"
+      assert False, "Unknown optimizer"
 
+    deltas = self.optimizer.compute_gradients(self.cost)
+    clipped_deltas = [(tf.clip_by_value(grad, -1., 1.), var) for grad, var in deltas]
+    self.training = self.optimizer.apply_gradients(clipped_deltas)
     # create target model
     self.train_iterations = 0
-    if args.target_steps:
-      self.target_model = Model(layers = self._createLayers(num_actions))
-      # Bug fix
-      for l in self.target_model.layers.layers:
-        l.parallelism = 'Disabled'
-      self.target_model.initialize(self.input_shape[:-1])
-      self.save_weights_prefix = args.save_weights_prefix
-    else:
-      self.target_model = self.model
+
+    self.target_model = dqg.DeepQArchitecture(self.history_length, self.num_actions, self.input)
 
     self.callback = None
 
-  def _createLayers(self, num_actions):
-    # create network
-    init_xavier_conv = Xavier(local=True)
-    init_xavier_affine = Xavier(local=False)
-    layers = []
-    # The first hidden layer convolves 32 filters of 8x8 with stride 4 with the input image and applies a rectifier nonlinearity.
-    layers.append(Conv((8, 8, 32), strides=4, init=init_xavier_conv, activation=Rectlin(), batch_norm=self.batch_norm))
-    # The second hidden layer convolves 64 filters of 4x4 with stride 2, again followed by a rectifier nonlinearity.
-    layers.append(Conv((4, 4, 64), strides=2, init=init_xavier_conv, activation=Rectlin(), batch_norm=self.batch_norm))
-    # This is followed by a third convolutional layer that convolves 64 filters of 3x3 with stride 1 followed by a rectifier.
-    layers.append(Conv((3, 3, 64), strides=1, init=init_xavier_conv, activation=Rectlin(), batch_norm=self.batch_norm))
-    # The final hidden layer is fully-connected and consists of 512 rectifier units.
-    layers.append(Affine(nout=512, init=init_xavier_affine, activation=Rectlin(), batch_norm=self.batch_norm))
-    # The output layer is a fully-connected linear layer with a single output for each valid action.
-    layers.append(Affine(nout=num_actions, init = init_xavier_affine))
-    return layers
+    # setup saver/loader
+    self.saver = tf.train.Saver()
 
-  def _setInput(self, states):
-    # change order of axes to match what Neon expects
-    states = np.transpose(states, axes = (1, 2, 3, 0))
-    # copy() shouldn't be necessary here, but Neon doesn't work otherwise
-    self.input.set(states.copy())
-    # normalize network input between 0 and 1
-    self.be.divide(self.input, 255, self.input)
+    init_op = ut.initialize_all_variables()
+    self.sess.run(init_op)
 
   def update_target_network(self):
-      # have to serialize also states for batch normalization to work
-      pdict = self.model.get_description(get_weights=True, keep_states=True)
-      self.target_model.deserialize(pdict, load_states=True)
+      self.target_model.copy_weights(self.model)
 
   def train(self, minibatch, epoch):
     # expand components of minibatch
@@ -116,21 +77,21 @@ class DeepQNetwork:
     assert prestates.shape[0] == actions.shape[0] == rewards.shape[0] == poststates.shape[0] == terminals.shape[0]
 
     # feed-forward pass for poststates to get Q-values
-    self._setInput(poststates)
-    postq = self.target_model.fprop(self.input, inference = True)
-    assert postq.shape == (self.num_actions, self.batch_size)
+    feed_poststates = np.transpose(poststates, [0,2,3,1])
+    postq = self.sess.run(self.target_model.q_values, {self.pre_input:feed_poststates})
+    assert postq.shape == (self.batch_size, self.num_actions)
 
     # calculate max Q-value for each poststate
-    maxpostq = self.be.max(postq, axis=0).asnumpyarray()
-    assert maxpostq.shape == (1, self.batch_size)
+    maxpostq = np.amax(postq, axis=1)
+    assert len(maxpostq) == self.batch_size
 
     # feed-forward pass for prestates
-    self._setInput(prestates)
-    preq = self.model.fprop(self.input, inference = False)
-    assert preq.shape == (self.num_actions, self.batch_size)
+    feed_prestates = np.transpose(prestates, [0, 2, 3, 1])
+    preq = self.sess.run(self.model.q_values, {self.pre_input:feed_prestates})
+    assert preq.shape == (self.batch_size, self.num_actions)
 
     # make copy of prestate Q-values as targets
-    targets = preq.asnumpyarray().copy()
+    targets = preq.copy()
 
     # clip rewards between -1 and 1
     rewards = np.clip(rewards, self.min_reward, self.max_reward)
@@ -138,55 +99,42 @@ class DeepQNetwork:
     # update Q-value targets for actions taken
     for i, action in enumerate(actions):
       if terminals[i]:
-        targets[action, i] = float(rewards[i])
+        targets[i,action] = float(rewards[i])
       else:
-        targets[action, i] = float(rewards[i]) + self.discount_rate * maxpostq[0,i]
+        targets[i,action] = float(rewards[i]) + self.discount_rate * maxpostq[i]
 
-    # copy targets to GPU memory
-    self.targets.set(targets)
+    # perform training
+    self.sess.run(self.training, {self.predqvals:preq, self.targets:targets})
 
-    # calculate errors
-    deltas = self.cost.get_errors(preq, self.targets)
-    assert deltas.shape == (self.num_actions, self.batch_size)
-    #assert np.count_nonzero(deltas.asnumpyarray()) == 32
-
-    # calculate cost, just in case
-    cost = self.cost.get_cost(preq, self.targets)
-    assert cost.shape == (1,1)
-
-    # clip errors
-    if self.clip_error:
-      self.be.clip(deltas, -self.clip_error, self.clip_error, out = deltas)
-
-    # perform back-propagation of gradients
-    self.model.bprop(deltas)
-
-    # perform optimization
-    self.optimizer.optimize(self.model.layers_to_optimize, epoch)
+    if(self.train_iterations % 100 == 0):
+        logger.info("I am actually training!")
 
     # increase number of weight updates (needed for stats callback)
     self.train_iterations += 1
 
     # calculate statistics
     if self.callback:
-      self.callback.on_train(cost[0,0])
+      self.callback.on_train(0)
 
   def predict(self, states):
     # minibatch is full size, because Neon doesn't let change the minibatch size
     assert states.shape == ((self.batch_size, self.history_length,) + self.screen_dim)
 
+    feed_states = np.transpose(states, [0,2,3,1])
     # calculate Q-values for the states
-    self._setInput(states)
-    qvalues = self.model.fprop(self.input, inference = True)
-    assert qvalues.shape == (self.num_actions, self.batch_size)
+    qvalues = self.sess.run(self.model.q_values, {self.pre_input:feed_states})
+    assert qvalues.shape == (self.batch_size, self.num_actions)
     if logger.isEnabledFor(logging.DEBUG):
-      logger.debug("Q-values: " + str(qvalues.asnumpyarray()[:,0]))
+      logger.debug("Q-values: " + str(qvalues[0,:]))
 
     # transpose the result, so that batch size is first dimension
-    return qvalues.T.asnumpyarray()
+    return qvalues
 
   def load_weights(self, load_path):
-    self.model.load_params(load_path)
+      self.saver.restore(self.sess, load_path)
 
   def save_weights(self, save_path):
-    self.model.save_params(save_path)
+    directory = os.path.dirname(save_path)
+    os.makedirs(directory, exist_ok=True)
+
+    self.saver.save(self.sess, save_path)
