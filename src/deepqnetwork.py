@@ -31,11 +31,10 @@ class DeepQNetwork:
     self.input = tf.to_float(self.pre_input) / 255.
 
     self.targets = tf.placeholder(tf.float32, shape=[None, self.num_actions])
-    self.predqvals = tf.placeholder(tf.float32, shape=[None, self.num_actions])
 
     self.model = dqg.DeepQArchitecture(self.history_length, self.num_actions, self.input)
 
-    self.cost = tf.nn.l2_loss(self.targets - self.predqvals) #tf.clip_by_value(x, -self.clip_error, self.clip_error)
+    self.cost = tf.nn.l2_loss(self.targets - self.model.q_values) #tf.clip_by_value(x, -self.clip_error, self.clip_error)
 
     if args.optimizer == 'rmsprop':
       self.optimizer = tf.train.RMSPropOptimizer(learning_rate=args.learning_rate, decay=args.decay_rate)
@@ -87,11 +86,8 @@ class DeepQNetwork:
 
     # feed-forward pass for prestates
     feed_prestates = np.transpose(prestates, [0, 2, 3, 1])
-    preq = self.sess.run(self.model.q_values, {self.pre_input:feed_prestates})
-    assert preq.shape == (self.batch_size, self.num_actions)
-
-    # make copy of prestate Q-values as targets
-    targets = preq.copy()
+    targets = self.sess.run(self.model.q_values, {self.pre_input:feed_prestates})
+    assert targets.shape == (self.batch_size, self.num_actions)
 
     # clip rewards between -1 and 1
     rewards = np.clip(rewards, self.min_reward, self.max_reward)
@@ -104,7 +100,7 @@ class DeepQNetwork:
         targets[i,action] = float(rewards[i]) + self.discount_rate * maxpostq[i]
 
     # perform training
-    self.sess.run(self.training, {self.predqvals:preq, self.targets:targets})
+    self.sess.run(self.training, {self.pre_input:feed_prestates, self.targets:targets})
 
     if(self.train_iterations % 100 == 0):
         logger.info("I am actually training!")
